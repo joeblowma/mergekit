@@ -182,6 +182,8 @@ class TensorWriterTask(Task[TensorWriter]):
     override_basename: Optional[str] = None
     use_async: bool = False
     write_threads: int = 1
+    disk_spool: bool = False
+    expected_final_size: Optional[int] = None
 
     def arguments(self) -> Dict[str, Task]:
         return {}
@@ -194,6 +196,8 @@ class TensorWriterTask(Task[TensorWriter]):
             override_basename=self.override_basename,
             use_async=self.use_async,
             max_write_threads=self.write_threads,
+            disk_spool=self.disk_spool,
+            expected_final_size=self.expected_final_size,
         )
 
     def priority(self):

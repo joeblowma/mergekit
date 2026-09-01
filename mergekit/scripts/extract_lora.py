@@ -3,6 +3,7 @@
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -17,9 +18,15 @@ from pydantic import BaseModel
 
 from mergekit.architecture import WeightInfo, arch_info_for_config
 from mergekit.card import generate_card_lora
-from mergekit.common import ModelReference, get_auto_cls
+from mergekit.common import ModelReference, dtype_from_name, get_auto_cls
 from mergekit.graph import Executor, Task
-from mergekit.io.tasks import FinalizeModel, LoadTensor, SaveTensor, TensorWriterTask
+from mergekit.io.tasks import (
+    FinalizeModel,
+    LoaderCache,
+    LoadTensor,
+    SaveTensor,
+    TensorWriterTask,
+)
 from mergekit.io.tensor_writer import TensorWriter
 from mergekit.multigpu_executor import MultiGPUExecutor
 from mergekit.options import MergeOptions, PrettyPrintHelp, add_merge_options
@@ -98,6 +105,12 @@ LOG = logging.getLogger("extract_lora")
     help="Skip saving undecomposable modules",
     default=False,
 )
+@click.option(
+    "--low-memory",
+    is_flag=True,
+    default=False,
+    help="Spool adapter tensors to disk during extraction to reduce RAM usage",
+)
 @add_merge_options
 def main(
     base_model: str,
@@ -111,9 +124,23 @@ def main(
     include_regexes: List[str],
     sv_epsilon: float,
     skip_undecomposable: bool,
+    low_memory: bool,
     merge_options: MergeOptions,
 ):
     merge_options.apply_global_options()
+
+    if low_memory and merge_options.low_cpu_memory:
+        raise click.UsageError("--low-memory cannot be combined with --low-cpu-memory.")
+    if low_memory and embed_lora:
+        raise click.UsageError("--low-memory cannot be combined with --embed-lora.")
+    if low_memory and not merge_options.safe_serialization:
+        raise click.UsageError(
+            "--low-memory requires safe serialization; remove --no-safe-serialization."
+        )
+    if low_memory and merge_options.async_write:
+        raise click.UsageError("--low-memory cannot be combined with --async-write.")
+
+    LoaderCache().setup(merge_options)
 
     if not modules_to_save:
         modules_to_save = []
@@ -141,6 +168,7 @@ def main(
         include_regexes=include_regexes,
         sv_epsilon=sv_epsilon,
         skip_undecomposable=skip_undecomposable,
+        low_memory=low_memory,
     )
 
     tasks = plan_result.tasks
@@ -345,6 +373,52 @@ class PlanResults(BaseModel):
     final_vocab_size: int
 
 
+def _tensor_output_size(tensor: torch.Tensor, weight_info: WeightInfo) -> int:
+    dtype = (
+        dtype_from_name(weight_info.force_dtype)
+        if weight_info.force_dtype
+        else tensor.dtype
+    )
+    return tensor.numel() * torch.empty((), dtype=dtype).element_size()
+
+
+def _estimate_full_module_size(
+    module: nn.Module, wi: WeightInfo, bias_wi: Optional[WeightInfo]
+) -> Tuple[int, int]:
+    size = _tensor_output_size(module.weight, wi)
+    count = 1
+    if bias_wi is not None and getattr(module, "bias", None) is not None:
+        size += _tensor_output_size(module.bias, bias_wi)
+        count += 1
+    return size, count
+
+
+def _estimate_lora_module_size(
+    module: nn.Module,
+    wi: WeightInfo,
+    bias_wi: Optional[WeightInfo],
+    max_rank: int,
+) -> Tuple[int, int]:
+    shape = module.weight.shape
+    # LoRA treats convolution kernels as an out_features by flattened
+    # in_features matrix. This is also the usual two-dimensional shape for
+    # Linear and Embedding weights, so the estimate covers every supported
+    # module type without dropping convolution kernel dimensions.
+    out_features = shape[0]
+    in_features = math.prod(shape[1:])
+    rank = min(max_rank, out_features, in_features)
+    size = (
+        rank
+        * (out_features + in_features)
+        * (_tensor_output_size(module.weight, wi) // module.weight.numel())
+    )
+    count = 2
+    if bias_wi is not None and getattr(module, "bias", None) is not None:
+        size += _tensor_output_size(module.bias, bias_wi)
+        count += 1
+    return size, count
+
+
 def plan_extraction(
     base_model_ref: ModelReference,
     model_ref: ModelReference,
@@ -358,16 +432,12 @@ def plan_extraction(
     include_regexes: Optional[List[str]] = None,
     sv_epsilon: float = 0,
     skip_undecomposable: bool = False,
+    low_memory: bool = False,
 ) -> PlanResults:
     targets = []
-    writer_task = TensorWriterTask(
-        out_path=out_path,
-        override_basename="adapter_model",
-        max_shard_size=-1,
-        safe_serialization=options.safe_serialization,
-        use_async=options.async_write,
-        max_write_threads=options.write_threads,
-    )
+    module_plans = []
+    estimated_tensor_bytes = 0
+    estimated_tensor_count = 0
 
     name_to_wi = all_weights_map(model_ref, options)
     dummy_base = _make_dummy_model(base_model_ref, options.trust_remote_code)
@@ -431,22 +501,22 @@ def plan_extraction(
 
         if name in modules_to_save or (name.split(".")[-1] in modules_to_save):
             LOG.info(f"Planning to save {name} at full rank")
-            targets.extend(plan_module_to_save(model_ref, writer_task, wi, bias_wi))
+            if low_memory:
+                size, count = _estimate_full_module_size(module, wi, bias_wi)
+                estimated_tensor_bytes += size
+                estimated_tensor_count += count
+            module_plans.append(("save", wi, bias_wi))
         elif _should_extract(name):
             if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)):
                 LOG.info(f"Planning LoRA extraction for {name}")
-                targets.extend(
-                    plan_lora_module(
-                        base_model_ref,
-                        model_ref,
-                        wi,
-                        bias_wi,
-                        writer_task,
-                        max_rank,
-                        distribute_scale,
-                        transpose=isinstance(module, nn.Embedding),
-                        sv_epsilon=sv_epsilon,
+                if low_memory:
+                    size, count = _estimate_lora_module_size(
+                        module, wi, bias_wi, max_rank
                     )
+                    estimated_tensor_bytes += size
+                    estimated_tensor_count += count
+                module_plans.append(
+                    ("lora", wi, bias_wi, isinstance(module, nn.Embedding))
                 )
             else:
                 key = name.split(".")[-1]
@@ -458,12 +528,52 @@ def plan_extraction(
                     # into modules_to_save it goes
                     if key not in modules_to_save:
                         modules_to_save.append(key)
-                    targets.extend(
-                        plan_module_to_save(model_ref, writer_task, wi, bias_wi)
-                    )
+                    if low_memory:
+                        size, count = _estimate_full_module_size(module, wi, bias_wi)
+                        estimated_tensor_bytes += size
+                        estimated_tensor_count += count
+                    module_plans.append(("save", wi, bias_wi))
                 if key not in warned_modules:
                     LOG.warning(message)
                     warned_modules.add(key)
+
+    expected_final_size = None
+    if low_memory:
+        # Safetensors metadata is small but non-zero; deliberately overestimate it
+        # so TensorWriter's staging-space preflight has a conservative bound.
+        expected_final_size = max(
+            1, estimated_tensor_bytes + 4096 + (estimated_tensor_count * 1024)
+        )
+
+    writer_task = TensorWriterTask(
+        out_path=out_path,
+        override_basename="adapter_model",
+        max_shard_size=-1,
+        safe_serialization=options.safe_serialization,
+        use_async=options.async_write,
+        max_write_threads=options.write_threads,
+        disk_spool=low_memory,
+        expected_final_size=expected_final_size,
+    )
+    for module_plan in module_plans:
+        if module_plan[0] == "save":
+            _, wi, bias_wi = module_plan
+            targets.extend(plan_module_to_save(model_ref, writer_task, wi, bias_wi))
+        else:
+            _, wi, bias_wi, transpose = module_plan
+            targets.extend(
+                plan_lora_module(
+                    base_model_ref,
+                    model_ref,
+                    wi,
+                    bias_wi,
+                    writer_task,
+                    max_rank,
+                    distribute_scale,
+                    transpose=transpose,
+                    sv_epsilon=sv_epsilon,
+                )
+            )
 
     save_tasks = [t for t in targets if isinstance(t, (SaveTensor, LoRAModuleSaveTask))]
     finalize = FinalizeModel(tensor_save_tasks=save_tasks, writer_task=writer_task)

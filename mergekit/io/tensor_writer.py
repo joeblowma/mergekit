@@ -4,9 +4,12 @@
 import json
 import logging
 import os
+import shutil
+import struct
+import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import safetensors
 import torch
@@ -20,6 +23,8 @@ class TensorWriter:
     max_shard_size: int
     safe_serialization: bool
     use_async: bool
+    disk_spool: bool
+    expected_final_size: Optional[int]
 
     shards_written: int
     weight_map: Dict[str, str]
@@ -29,6 +34,10 @@ class TensorWriter:
     _lock: threading.RLock
     _executor: Optional[ThreadPoolExecutor]
     _write_futures: List[Future]
+    _spool_dir: Optional[str]
+    _spool_entries: Dict[str, Tuple[str, int]]
+    _spool_sequence: int
+    _finalized: bool
 
     def __init__(
         self,
@@ -38,14 +47,29 @@ class TensorWriter:
         override_basename: Optional[str] = None,
         use_async: bool = False,
         max_write_threads: int = 1,
+        disk_spool: bool = False,
+        expected_final_size: Optional[int] = None,
     ) -> None:
         os.makedirs(out_path, exist_ok=True)
+
+        if disk_spool and not safe_serialization:
+            raise ValueError("disk_spool requires safe_serialization=True")
+        if disk_spool and use_async:
+            raise ValueError("disk_spool requires synchronous writes (use_async=False)")
+        if disk_spool and expected_final_size is None:
+            raise ValueError(
+                "disk_spool requires expected_final_size so staging free space can be preflighted"
+            )
+        if expected_final_size is not None and expected_final_size < 0:
+            raise ValueError("expected_final_size must be non-negative")
 
         self.out_path = out_path
         self.override_basename = override_basename
         self.max_shard_size = max_shard_size
         self.safe_serialization = safe_serialization
         self.use_async = use_async
+        self.disk_spool = disk_spool
+        self.expected_final_size = expected_final_size
 
         self.shards_written = 0
         self.weight_map = {}
@@ -55,14 +79,23 @@ class TensorWriter:
 
         self._lock = threading.RLock()
         self._write_futures = []
+        self._spool_dir = None
+        self._spool_entries = {}
+        self._spool_sequence = 0
+        self._finalized = False
         if self.use_async:
             self._executor = ThreadPoolExecutor(max_workers=max_write_threads)
+        if self.disk_spool:
+            self._spool_dir = self._create_spool_dir()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.finalize()
+        # A failed merge must leave the staged tensors available for diagnosis or
+        # recovery rather than publishing a partial adapter.
+        if exc_type is None or not self.disk_spool:
+            self.finalize()
 
     def save_tensor(self, name: str, tensor: torch.Tensor, clone: bool = False):
         if not tensor.is_contiguous():
@@ -72,6 +105,9 @@ class TensorWriter:
 
         tensor_size = tensor.numel() * tensor.element_size()
         with self._lock:
+            if self.disk_spool:
+                self._spool_tensor(name, tensor, tensor_size)
+                return
             if (
                 self.current_shard
                 and self.max_shard_size > 0
@@ -131,6 +167,14 @@ class TensorWriter:
         LOG.info(f"Finished writing shard #{shard_index + 1}.")
 
     def finalize(self):
+        if self.disk_spool:
+            with self._lock:
+                if self._finalized:
+                    return
+                self._finalize_spool()
+                self._finalized = True
+            return
+
         with self._lock:
             self._flush_current_shard()
 
@@ -219,3 +263,182 @@ class TensorWriter:
                 _do_save(shard_data)
             else:
                 raise
+
+    def _create_spool_dir(self) -> str:
+        """Create a durable, self-describing staging directory beside the output."""
+        assert self.expected_final_size is not None
+        required = max(1, 2 * self.expected_final_size)
+        available = shutil.disk_usage(self.out_path).free
+        if available < required:
+            raise OSError(
+                "Insufficient free space for disk_spool: "
+                f"need about {required} bytes (2x expected_final_size), "
+                f"but only {available} bytes are available at {self.out_path!r}."
+            )
+
+        spool_dir = tempfile.mkdtemp(
+            prefix=".mergekit-tensor-spool-", dir=self.out_path
+        )
+        self._write_spool_manifest(spool_dir, state="staging")
+        LOG.info("Disk-spooling tensors to recoverable staging directory %s", spool_dir)
+        return spool_dir
+
+    def _write_spool_manifest(self, spool_dir: str, state: str) -> None:
+        """Atomically persist enough information to identify a recoverable spool."""
+        manifest_path = os.path.join(spool_dir, "manifest.json")
+        temporary_path = f"{manifest_path}.tmp"
+        entries = [
+            {"name": name, "file": filename, "size": size}
+            for name, (filename, size) in self._spool_entries.items()
+        ]
+        with open(temporary_path, "w", encoding="utf-8") as manifest:
+            json.dump(
+                {
+                    "format": "mergekit-tensor-writer-spool-v1",
+                    "state": state,
+                    "expected_final_size": self.expected_final_size,
+                    "tensors": entries,
+                },
+                manifest,
+                indent=2,
+                sort_keys=True,
+            )
+            manifest.flush()
+            os.fsync(manifest.fileno())
+        os.replace(temporary_path, manifest_path)
+        self._fsync_directory(spool_dir)
+
+    def _spool_tensor(self, name: str, tensor: torch.Tensor, tensor_size: int) -> None:
+        """Synchronously save one tensor, releasing its caller-owned reference on return."""
+        assert self._spool_dir is not None
+        previous_entry = self._spool_entries.get(name)
+        sequence = self._spool_sequence
+        spool_name = f"tensor-{sequence:08d}.safetensors"
+        spool_path = os.path.join(self._spool_dir, spool_name)
+        temporary_path = f"{spool_path}.tmp"
+        self._save_st({name: tensor}, temporary_path)
+        self._fsync_file(temporary_path)
+        os.replace(temporary_path, spool_path)
+        self._spool_sequence += 1
+        self._spool_entries[name] = (spool_name, tensor_size)
+        self.total_size = sum(size for _, size in self._spool_entries.values())
+        self._write_spool_manifest(self._spool_dir, state="staging")
+        if previous_entry is not None and previous_entry[0] != spool_name:
+            # Once the manifest references the replacement, the superseded copy
+            # is no longer required for recovery.
+            os.unlink(os.path.join(self._spool_dir, previous_entry[0]))
+            self._fsync_directory(self._spool_dir)
+
+    def _finalize_spool(self) -> None:
+        """Assemble staged safetensors by copying payload bytes, never all tensors at once."""
+        assert self._spool_dir is not None
+        self._write_spool_manifest(self._spool_dir, state="finalizing")
+        prefix, _ = self._get_name_components()
+        destination = os.path.join(self.out_path, f"{prefix}.safetensors")
+        temporary_destination = f"{destination}.tmp"
+
+        try:
+            header, payloads = self._spool_final_header()
+            with open(temporary_destination, "wb") as output:
+                output.write(struct.pack("<Q", len(header)))
+                output.write(header)
+                for spool_path, offset, size in payloads:
+                    with open(spool_path, "rb") as staged:
+                        staged.seek(offset)
+                        self._copy_exact(staged, output, size)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_destination, destination)
+            self._fsync_directory(self.out_path)
+        except Exception:
+            # The staging directory and its manifest intentionally remain intact.
+            # Remove only an incomplete final temp file, never the previous output.
+            if os.path.exists(temporary_destination):
+                os.unlink(temporary_destination)
+            raise
+
+        # A fully closed and atomically published artifact is the only condition
+        # under which staging may be removed.
+        shutil.rmtree(self._spool_dir)
+        self._spool_dir = None
+
+    def _spool_final_header(self) -> Tuple[bytes, List[Tuple[str, int, int]]]:
+        entries = {"__metadata__": {"format": "pt"}}
+        payloads = []
+        data_offset = 0
+        assert self._spool_dir is not None
+        for name, (filename, expected_size) in self._spool_entries.items():
+            path = os.path.join(self._spool_dir, filename)
+            tensor_info, payload_offset, payload_size = self._read_staged_tensor(
+                path, name
+            )
+            if payload_size != expected_size:
+                raise RuntimeError(
+                    f"Staged tensor {name!r} has {payload_size} bytes, expected {expected_size}"
+                )
+            entries[name] = {
+                "dtype": tensor_info["dtype"],
+                "shape": tensor_info["shape"],
+                "data_offsets": [data_offset, data_offset + payload_size],
+            }
+            payloads.append((path, payload_offset, payload_size))
+            data_offset += payload_size
+
+        header = json.dumps(entries, separators=(",", ":")).encode("utf-8")
+        # Safetensors headers are padded to eight bytes; JSON whitespace is valid.
+        header += b" " * ((-len(header)) % 8)
+        return header, payloads
+
+    @staticmethod
+    def _read_staged_tensor(path: str, name: str) -> Tuple[dict, int, int]:
+        with open(path, "rb") as staged:
+            header_size_data = staged.read(8)
+            if len(header_size_data) != 8:
+                raise RuntimeError(
+                    f"Staged tensor file {path!r} has no safetensors header"
+                )
+            header_size = struct.unpack("<Q", header_size_data)[0]
+            header = json.loads(staged.read(header_size))
+        tensor_names = [key for key in header if key != "__metadata__"]
+        if tensor_names != [name]:
+            raise RuntimeError(
+                f"Staged tensor file {path!r} does not contain only {name!r}"
+            )
+        tensor_info = header[name]
+        offsets = tensor_info.get("data_offsets")
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or offsets[0] > offsets[1]
+        ):
+            raise RuntimeError(f"Staged tensor file {path!r} has invalid data offsets")
+        payload_size = offsets[1] - offsets[0]
+        return tensor_info, 8 + header_size + offsets[0], payload_size
+
+    @staticmethod
+    def _copy_exact(source, destination, size: int) -> None:
+        remaining = size
+        while remaining:
+            chunk = source.read(min(16 * 1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("Unexpected end of staged tensor payload")
+            destination.write(chunk)
+            remaining -= len(chunk)
+
+    @staticmethod
+    def _fsync_file(path: str) -> None:
+        # Windows requires a writable handle for FlushFileBuffers/fsync.
+        with open(path, "r+b") as file:
+            os.fsync(file.fileno())
+
+    @staticmethod
+    def _fsync_directory(path: str) -> None:
+        # Windows cannot open directories as file descriptors. File fsync and the
+        # atomic replace above still provide the durable staging contract there.
+        if os.name == "nt":
+            return
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
