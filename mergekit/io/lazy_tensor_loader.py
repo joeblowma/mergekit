@@ -107,12 +107,14 @@ class LazyTensorLoader:
     index: ShardedTensorIndex
     current_shard: Optional[TensorLoader]
     lazy_unpickle: bool
+    low_memory_extreme: bool
     lock: threading.Lock
 
     def __init__(self, index: ShardedTensorIndex, lazy_unpickle: bool = True):
         self.index = index
         self.current_shard = None
         self.lazy_unpickle = lazy_unpickle
+        self.low_memory_extreme = False
         self.lock = threading.Lock()
 
     def get_tensor(
@@ -142,7 +144,10 @@ class LazyTensorLoader:
                 shard_full_path = os.path.join(self.index.base_path, shard_file)
                 logging.debug(f"Opening shard {shard_full_path}")
                 self.current_shard = TensorLoader.get(
-                    shard_full_path, use_lazy_unpickle=self.lazy_unpickle, device=device
+                    shard_full_path,
+                    use_lazy_unpickle=self.lazy_unpickle,
+                    device=device,
+                    low_memory_extreme=self.low_memory_extreme,
                 )
 
             return self.current_shard.get_tensor(key).to(device)

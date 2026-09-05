@@ -22,6 +22,7 @@ class LoaderCache:
     lora_cache_dir: Optional[str] = None
     hf_cache_dir: Optional[str] = None
     lazy_unpickle: bool = False
+    low_memory_extreme: bool = False
     trust_remote_code: bool = False
     lora_merge_dtype: Optional[str] = None
 
@@ -40,9 +41,11 @@ class LoaderCache:
                 trust_remote_code=self.trust_remote_code,
                 lora_merge_dtype=self.lora_merge_dtype,
             )
-            self.loaders[model] = merged.lazy_loader(
+            loader = merged.lazy_loader(
                 cache_dir=self.hf_cache_dir, lazy_unpickle=self.lazy_unpickle
             )
+            loader.low_memory_extreme = self.low_memory_extreme
+            self.loaders[model] = loader
         return self.loaders[model]
 
     def flush_all(self):

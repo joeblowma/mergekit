@@ -109,7 +109,28 @@ LOG = logging.getLogger("extract_lora")
     "--low-memory",
     is_flag=True,
     default=False,
-    help="Spool adapter tensors to disk during extraction to reduce RAM usage",
+    help=(
+        "Spool extracted adapter tensors to disk instead of holding them all in RAM "
+        "until finalize, keeping memory bounded. Use when RAM/commit charge grows "
+        "toward the system limit (RAM + pagefile) while extracting large models. "
+        "Requires --safe-serialization; cannot be combined with --low-cpu-memory, "
+        "--embed-lora, or --async-write. Note: full float32 SVD is still a "
+        "per-matrix memory limit."
+    ),
+)
+@click.option(
+    "--low-memory-extreme",
+    is_flag=True,
+    default=False,
+    help=(
+        "Lowest RAM/commit mode: implies --low-memory (spools adapter tensors to "
+        "disk) AND streams source tensors by reading only the requested tensor's "
+        "bytes instead of mmap-ing whole safetensors shards. On Windows the shard "
+        "mmap counts toward process private commit, so this bounds source-loading "
+        "commit by tensor size instead of shard size. Requires --safe-serialization; "
+        "cannot be combined with --low-cpu-memory, --embed-lora, or --async-write. "
+        "Note: full float32 SVD is still a per-matrix memory limit."
+    ),
 )
 @add_merge_options
 def main(
@@ -125,9 +146,13 @@ def main(
     sv_epsilon: float,
     skip_undecomposable: bool,
     low_memory: bool,
+    low_memory_extreme: bool,
     merge_options: MergeOptions,
 ):
     merge_options.apply_global_options()
+
+    if low_memory_extreme:
+        low_memory = True
 
     if low_memory and merge_options.low_cpu_memory:
         raise click.UsageError("--low-memory cannot be combined with --low-cpu-memory.")
@@ -141,6 +166,7 @@ def main(
         raise click.UsageError("--low-memory cannot be combined with --async-write.")
 
     LoaderCache().setup(merge_options)
+    LoaderCache().low_memory_extreme = low_memory_extreme
 
     if not modules_to_save:
         modules_to_save = []
