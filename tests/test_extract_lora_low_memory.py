@@ -255,7 +255,14 @@ def test_low_memory_plan_builds_spooled_lora_graph_without_download(
     save_tasks = [
         task
         for task in plan.tasks
-        if isinstance(task, (io_tasks.SaveTensor, extract_lora.LoRAModuleSaveTask))
+        if isinstance(
+            task,
+            (
+                io_tasks.SaveTensor,
+                extract_lora.LoRAModuleSaveTask,
+                extract_lora.LoRABiasSaveTask,
+            ),
+        )
     ]
     assert save_tasks
     writer_task = save_tasks[0].writer_task

@@ -139,10 +139,13 @@ LOG = logging.getLogger("extract_lora")
     default=False,
     help=(
         "Skip full-rank (modules_to_save) tensors whose fine-tuned weights are "
-        "byte-identical to the base model. Reads both copies of each candidate "
-        "tensor from disk and removes unchanged modules from the adapter and "
-        "its modules_to_save config. Respects --low-memory-extreme single-tensor "
-        "reading."
+        "byte-identical to the base model, and skip LoRA modules whose "
+        "extracted delta is exactly zero (detected at runtime). Reads both "
+        "copies of each candidate full-save tensor from disk and removes "
+        "unchanged modules from the adapter and its modules_to_save config. "
+        "Zero-delta LoRA modules skip their SVD and tensor writes and are "
+        "dropped from target_modules/rank_pattern in adapter_config.json. "
+        "Respects --low-memory-extreme single-tensor reading."
     ),
 )
 @click.option(
@@ -176,7 +179,9 @@ LOG = logging.getLogger("extract_lora")
     help=(
         "Plan the extraction, print a size/time report, and exit without "
         "creating the executor or writing any files. With "
-        "--skip-unchanged-modules the actual candidate-tensor reads still occur."
+        "--skip-unchanged-modules the actual candidate-tensor reads still occur; "
+        "zero-delta LoRA modules are only detectable at runtime and are NOT "
+        "reflected in this estimate."
     ),
 )
 @add_merge_options
@@ -279,12 +284,23 @@ def main(
         )
 
     reset_embed_lora_decisions()
+    reset_zero_delta_skips()
     module_real_ranks = {}
     for task, result in executor.run():
         if isinstance(task, TaskVectorDecompositionTask):
+            if result[0] is None:
+                continue
             module_real_ranks[task.weight_info.name.removesuffix(".weight")] = result[
                 0
             ].shape[0]
+
+    zero_skips = get_zero_delta_skips()
+    if zero_skips:
+        LOG.info(
+            "Skipped %d zero-delta LoRA module(s), saving ~%s of adapter bytes",
+            len(zero_skips),
+            _human_bytes(sum(zero_skips.values())),
+        )
 
     # Merge runtime adaptive-embedding decisions into the config assembly.
     for base_name, (treatment, rank) in get_embed_lora_decisions().items():
@@ -357,11 +373,37 @@ class TaskVectorDecompositionTask(Task[Tuple[torch.Tensor, torch.Tensor]]):
     distribute_scale: bool = True
     transpose: bool = False
     sv_epsilon: float = 0
+    skip_zero_delta: bool = False
+    bias_task: Optional[Task] = None
 
     def arguments(self) -> Dict[str, Any]:
-        return {"task_vector": self.input_task}
+        args = {"task_vector": self.input_task}
+        if self.bias_task is not None:
+            args["bias"] = self.bias_task
+        return args
 
-    def execute(self, task_vector: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def execute(
+        self, task_vector: torch.Tensor, bias: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.skip_zero_delta
+            and not torch.any(task_vector)
+            and (bias is None or not torch.any(bias))
+        ):
+            rank = min(
+                self.max_rank,
+                min(task_vector.shape[-2], task_vector.shape[-1]),
+            )
+            bytes_saved = (
+                rank
+                * (task_vector.shape[-2] + task_vector.shape[-1])
+                * task_vector.element_size()
+            )
+            if bias is not None:
+                bytes_saved += bias.numel() * bias.element_size()
+            record_zero_delta_skip(self.weight_info.name, bytes_saved)
+            LOG.debug("Skipping zero-delta LoRA module %s", self.weight_info.name)
+            return (None, None)
         if self.transpose:
             task_vector = task_vector.T
         out_dtype = task_vector.dtype
@@ -424,6 +466,7 @@ class LoRAModuleSaveTask(Task):
     writer_task: TensorWriterTask
     model_ref: ModelReference
     decomposition_task: TaskVectorDecompositionTask
+    skip_zero_delta: bool = False
 
     def arguments(self) -> Dict[str, Any]:
         return {"writer": self.writer_task, "decomp": self.decomposition_task}
@@ -433,6 +476,9 @@ class LoRAModuleSaveTask(Task):
     ) -> None:
         weight_a, weight_b = decomp
         if weight_a is None or weight_b is None:
+            if self.skip_zero_delta:
+                # Legitimate zero-delta skip: nothing to write.
+                return
             if not self.weight_info.optional:
                 raise RuntimeError(
                     f"No SVD decomposition for required weight {self.weight_info.name}"
@@ -453,6 +499,51 @@ class LoRAModuleSaveTask(Task):
 
     def group_label(self) -> Optional[str]:
         return self.decomposition_task.group_label()
+
+
+class LoRABiasSaveTask(Task):
+    """Write a LoRA module's lora_B bias, skipping it for zero-delta modules.
+
+    Replaces the bare ``SaveTensor`` previously used for the bias so the bias
+    write can be tied to the decomposition result: when the decomposition task
+    zero-delta-skipped the module, the bias is by construction also zero and
+    must not be written.
+    """
+
+    tensor_name: str
+    bias_task: Task
+    decomposition_task: TaskVectorDecompositionTask
+    writer_task: TensorWriterTask
+    optional: bool = False
+
+    def arguments(self) -> Dict[str, Any]:
+        return {
+            "writer": self.writer_task,
+            "bias": self.bias_task,
+            "decomp": self.decomposition_task,
+        }
+
+    def execute(
+        self,
+        writer: TensorWriter,
+        bias: Optional[torch.Tensor],
+        decomp: Tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        if decomp[0] is None:
+            # Module was zero-delta-skipped; by construction the bias delta is
+            # zero too, so there is nothing to write and no warning needed.
+            return
+        if bias is None:
+            if not self.optional:
+                raise RuntimeError(f"No value for required tensor {self.tensor_name}")
+            return
+        writer.save_tensor(self.tensor_name, bias, clone=False)
+
+    def priority(self) -> int:
+        return 1000
+
+    def group_label(self) -> Optional[str]:
+        return self.bias_task.group_label()
 
 
 # Thread-safe registry of runtime adaptive-embedding decisions, populated by
@@ -478,6 +569,30 @@ def record_embed_lora_decision(
 def get_embed_lora_decisions() -> Dict[str, Tuple[str, Optional[int]]]:
     with _embed_lora_lock:
         return dict(_embed_lora_decisions)
+
+
+# Thread-safe registry of runtime zero-delta LoRA skips, populated by
+# TaskVectorDecompositionTask.execute and consumed by main() after
+# executor.run() (for the summary log). Stores no tensors, so executor
+# last-use reclamation is unaffected.
+_zero_delta_skips: Dict[str, int] = {}
+_zero_delta_lock = threading.Lock()
+
+
+def reset_zero_delta_skips() -> None:
+    """Clear the zero-delta skip registry (used by tests)."""
+    with _zero_delta_lock:
+        _zero_delta_skips.clear()
+
+
+def record_zero_delta_skip(name: str, bytes_saved: int) -> None:
+    with _zero_delta_lock:
+        _zero_delta_skips[name] = bytes_saved
+
+
+def get_zero_delta_skips() -> Dict[str, int]:
+    with _zero_delta_lock:
+        return dict(_zero_delta_skips)
 
 
 # VRAM estimate for a float32 SVD: the delta matrix plus an output factor of
@@ -1151,13 +1266,17 @@ def plan_extraction(
                     distribute_scale,
                     transpose=transpose,
                     sv_epsilon=sv_epsilon,
+                    skip_zero_delta=skip_unchanged_modules,
                 )
             )
 
     save_tasks = [
         t
         for t in targets
-        if isinstance(t, (SaveTensor, LoRAModuleSaveTask, AdaptiveEmbeddingSaveTask))
+        if isinstance(
+            t,
+            (SaveTensor, LoRAModuleSaveTask, LoRABiasSaveTask, AdaptiveEmbeddingSaveTask),
+        )
     ]
     finalize = FinalizeModel(tensor_save_tasks=save_tasks, writer_task=writer_task)
     return PlanResults(
@@ -1182,11 +1301,19 @@ def plan_lora_module(
     distribute_scale: bool = True,
     transpose: bool = False,
     sv_epsilon: float = 0,
+    skip_zero_delta: bool = False,
 ) -> List[Task]:
     targets = []
     base_load_task = _wi_load(base_model_ref, wi)
     model_load_task = _wi_load(model_ref, wi)
     tv_task = TaskVectorTask(base_tensor=base_load_task, model_tensor=model_load_task)
+    tv_bias_task = None
+    if bias_wi is not None:
+        base_bias_load_task = _wi_load(base_model_ref, bias_wi)
+        model_bias_load_task = _wi_load(model_ref, bias_wi)
+        tv_bias_task = TaskVectorTask(
+            base_tensor=base_bias_load_task, model_tensor=model_bias_load_task
+        )
     decomp_task = TaskVectorDecompositionTask(
         weight_info=wi,
         input_task=tv_task,
@@ -1194,6 +1321,8 @@ def plan_lora_module(
         distribute_scale=distribute_scale,
         transpose=transpose,
         sv_epsilon=sv_epsilon,
+        skip_zero_delta=skip_zero_delta,
+        bias_task=tv_bias_task,
     )
     targets.append(decomp_task)
     targets.append(
@@ -1202,23 +1331,19 @@ def plan_lora_module(
             writer_task=writer_task,
             model_ref=model_ref,
             decomposition_task=decomp_task,
+            skip_zero_delta=skip_zero_delta,
         )
     )
     if bias_wi is not None:
-        base_bias_load_task = _wi_load(base_model_ref, bias_wi)
-        model_bias_load_task = _wi_load(model_ref, bias_wi)
-        tv_bias_task = TaskVectorTask(
-            base_tensor=base_bias_load_task, model_tensor=model_bias_load_task
-        )
         base_bias_name = bias_wi.name.removesuffix(".bias")
         name_out = f"base_model.model.{base_bias_name}.lora_B.bias"
         targets.append(
-            SaveTensor(
+            LoRABiasSaveTask(
                 tensor_name=name_out,
-                tensor_task=tv_bias_task,
+                bias_task=tv_bias_task,
+                decomposition_task=decomp_task,
                 writer_task=writer_task,
                 optional=bias_wi.optional,
-                clone=False,
             )
         )
     return targets
@@ -1329,6 +1454,11 @@ def _print_dry_run_report(
         click.echo(
             f"Total bytes saved by skipping: {saved_total} "
             f"({_human_bytes(saved_total)})"
+        )
+    if skip_unchanged_modules:
+        click.echo(
+            "Note: zero-delta LoRA modules are only detectable at runtime and "
+            "are NOT reflected in this estimate."
         )
     est_io = 2 * plan_result.estimated_tensor_bytes + total
     seconds = est_io / (100 * 1024 * 1024)
