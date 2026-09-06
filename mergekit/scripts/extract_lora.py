@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import click
 import torch
@@ -152,10 +152,12 @@ LOG = logging.getLogger("extract_lora")
     help=(
         "Adaptively decompose embedding-type modules (input/output embeddings) "
         "into LoRA when that wins on size, instead of saving full copies. "
-        "Performs a full float32 SVD of the embedding delta (same per-matrix "
-        "memory caveat as the regular LoRA path) and only writes "
+        "Performs a full float32 SVD of the embedding delta and only writes "
         "lora_embedding_A/B when rank*(vocab+dim) < vocab*dim; otherwise falls "
-        "back to a full copy. Ignored when --embed-lora is set."
+        "back to a full copy. If the delta is too large for GPU memory the SVD "
+        "automatically falls back to CPU (RAM need is ~3x the float32 delta "
+        "size, e.g. ~12 GB for a 248k-vocab 9B model). Ignored when "
+        "--embed-lora is set."
     ),
 )
 @click.option(
@@ -363,9 +365,18 @@ class TaskVectorDecompositionTask(Task[Tuple[torch.Tensor, torch.Tensor]]):
         if self.transpose:
             task_vector = task_vector.T
         out_dtype = task_vector.dtype
-        u, s, vh = torch.linalg.svd(
-            task_vector.to(dtype=torch.float32), full_matrices=False
-        )
+        delta = task_vector.to(dtype=torch.float32)
+        try:
+            u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            LOG.warning(
+                "GPU out of memory during SVD of %s; retrying on CPU",
+                self.weight_info.name,
+            )
+            delta = delta.to("cpu")
+            u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+        del delta
         rank = min(self.max_rank, s.shape[0])
         if self.sv_epsilon > 0:
             rank = min((s > self.sv_epsilon).sum().item(), rank)
@@ -469,6 +480,95 @@ def get_embed_lora_decisions() -> Dict[str, Tuple[str, Optional[int]]]:
         return dict(_embed_lora_decisions)
 
 
+# VRAM estimate for a float32 SVD: the delta matrix plus an output factor of
+# comparable size plus the gesdd/cuSOLVER workspace. 2.5x the delta is a safe
+# upper bound that keeps the GPU fast path for everything that comfortably fits.
+_SVD_CUDA_ESTIMATE_FACTOR = 2.5
+# Only commit to the GPU when the estimate fits within 90% of currently free
+# VRAM, leaving headroom for the caching allocator and co-resident tensors.
+_SVD_CUDA_SAFETY_MARGIN = 0.9
+
+
+def _on_cuda(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` lives on a CUDA device.
+
+    A one-line seam over ``tensor.is_cuda`` so CPU-only tests can exercise the
+    accelerator branch without a real GPU.
+    """
+    return tensor.is_cuda
+
+
+def _cuda_free_bytes() -> int:
+    """Free bytes on the current CUDA device (0 when CUDA is unavailable)."""
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.mem_get_info()[0]
+
+
+def _svd_fits_on_cuda(
+    delta_f32_bytes: int,
+    free_memory_source: Optional[Callable[[], int]] = None,
+) -> bool:
+    """Estimate whether a float32 SVD of ``delta_f32_bytes`` fits in free VRAM.
+
+    ``delta_f32_bytes`` is the byte size of the float32 delta matrix. The SVD
+    needs roughly the delta plus a same-sized output factor plus a gesdd
+    workspace, estimated here as ``delta_f32_bytes * _SVD_CUDA_ESTIMATE_FACTOR``.
+    The estimate must fit within ``_SVD_CUDA_SAFETY_MARGIN`` of free VRAM.
+    ``free_memory_source`` injects the free-byte source for tests.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if free_memory_source is None:
+        free_memory_source = _cuda_free_bytes
+    free_bytes = free_memory_source()
+    if free_bytes <= 0:
+        return False
+    required = delta_f32_bytes * _SVD_CUDA_ESTIMATE_FACTOR
+    return required <= free_bytes * _SVD_CUDA_SAFETY_MARGIN
+
+
+def _embedding_delta_svd(
+    base: torch.Tensor, model: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(u, s, vh) = SVD(float32(model - base).T)`` with a CPU fallback.
+
+    Uses the GPU when the delta is already on CUDA and the estimated SVD
+    footprint fits in free VRAM; otherwise computes on CPU. A CUDA
+    out-of-memory error empties the CUDA cache and retries the SVD on CPU.
+    The GPU fast path is byte-identical to a plain ``torch.linalg.svd``.
+    """
+    use_cuda = _on_cuda(model)
+    delta_bytes = model.numel() * 4  # torch.float32 is 4 bytes per element
+
+    if use_cuda and _svd_fits_on_cuda(delta_bytes):
+        # GPU attempt.
+        delta = (model - base).to(dtype=torch.float32)
+        try:
+            u, s, vh = torch.linalg.svd(delta.T, full_matrices=False)
+            del delta
+            return u, s, vh
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            LOG.warning("GPU out of memory during embedding SVD; retrying on CPU")
+            delta_cpu = delta.to("cpu")
+            del delta
+    else:
+        if use_cuda:
+            LOG.info(
+                "embedding SVD too large for GPU (need ~%s, free %s), using CPU",
+                _human_bytes(delta_bytes * _SVD_CUDA_ESTIMATE_FACTOR),
+                _human_bytes(_cuda_free_bytes()),
+            )
+        # Compute the float32 delta directly on CPU so the large CUDA input
+        # copies are never duplicated.
+        delta_cpu = (model.to("cpu") - base.to("cpu")).to(dtype=torch.float32)
+
+    u, s, vh = torch.linalg.svd(delta_cpu.T, full_matrices=False)
+    del delta_cpu
+    return u, s, vh
+
+
 class AdaptiveEmbeddingSaveTask(Task):
     """Decompose an embedding delta into LoRA when it wins on size.
 
@@ -500,29 +600,43 @@ class AdaptiveEmbeddingSaveTask(Task):
 
         if base is None or model is None:
             if model is not None:
+                LOG.info("%s: base tensor missing, saving full copy", base_name)
                 writer.save_tensor(f"base_model.model.{name}", model)
                 record_embed_lora_decision(base_name, "full", None)
             else:
+                LOG.info("%s: model tensor missing, omitting from adapter", base_name)
                 record_embed_lora_decision(base_name, "skipped", 0)
             return
 
         out_dtype = model.dtype
-        delta = (model - base).to(dtype=torch.float32)
-        del base
-        m, n = delta.shape
+        m, n = model.shape
         # SVD on delta.T to match LoRAModuleSaveTask's transpose branch
         # (lora_embedding_A is [r, vocab], lora_embedding_B is [hidden, r]).
-        u, s, vh = torch.linalg.svd(delta.T, full_matrices=False)
-        del delta
+        # Falls back to CPU when the float32 delta won't fit on the GPU.
+        u, s, vh = _embedding_delta_svd(base, model)
+        del base
         rank = _select_adaptive_rank(s, m, n, self.tolerance)
         if rank == 0:
+            LOG.info("%s: delta is zero, omitting from adapter", base_name)
             record_embed_lora_decision(base_name, "skipped", 0)
             return
         if rank < 0:
+            needed_rank = _needed_rank_for_tolerance(s, self.tolerance)
+            breakeven = m * n // (m + n) + 1
+            LOG.info(
+                "%s: full copy (tolerance=%.1e needs rank %d, "
+                "LoRA breakeven rank %d)",
+                base_name, self.tolerance, needed_rank, breakeven,
+            )
             writer.save_tensor(f"base_model.model.{name}", model)
             record_embed_lora_decision(base_name, "full", None)
             return
 
+        energy_frac = float((s[:rank] ** 2).sum() / (s ** 2).sum())
+        LOG.info(
+            "%s: adaptive LoRA rank=%d (tolerance=%.1e, energy=%.6f)",
+            base_name, rank, self.tolerance, energy_frac,
+        )
         # Same naming/scaling convention as LoRAModuleSaveTask's transpose
         # branch (distribute_scale=True): sqrt(S) split into both factors.
         sqrt_s = torch.diag(torch.sqrt(s[:rank]))
@@ -550,13 +664,12 @@ class AdaptiveEmbeddingSaveTask(Task):
         return True
 
 
-def _select_adaptive_rank(
-    s: torch.Tensor, m: int, n: int, tolerance: float
-) -> int:
-    """Pick the adaptive LoRA rank for an embedding delta.
+def _needed_rank_for_tolerance(s: torch.Tensor, tolerance: float) -> int:
+    """Smallest rank r with tail-energy ≤ tolerance²·total.
 
-    Returns 0 for a zero delta, -1 when a full copy wins on size, and the chosen
-    rank otherwise. Singular values ``s`` must be in descending order.
+    Returns 0 for a zero delta, or the rank (possibly ``full_rank`` if the
+    tolerance is not met by any prefix).  Singular values ``s`` must be in
+    descending order.
     """
     s2 = s * s
     total = s2.sum()
@@ -568,9 +681,24 @@ def _select_adaptive_rank(
     for r in range(1, full_rank + 1):
         tail_ratio2 = (total - cum[r - 1]) / total
         if tail_ratio2.item() <= tol2:
-            if r < full_rank and r * (m + n) < m * n:
-                return r
-            return -1
+            return r
+    return full_rank
+
+
+def _select_adaptive_rank(
+    s: torch.Tensor, m: int, n: int, tolerance: float
+) -> int:
+    """Pick the adaptive LoRA rank for an embedding delta.
+
+    Returns 0 for a zero delta, -1 when a full copy wins on size, and the chosen
+    rank otherwise. Singular values ``s`` must be in descending order.
+    """
+    needed = _needed_rank_for_tolerance(s, tolerance)
+    if needed == 0:
+        return 0
+    full_rank = s.shape[0]
+    if needed < full_rank and needed * (m + n) < m * n:
+        return needed
     return -1
 
 
